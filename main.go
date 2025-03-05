@@ -22,7 +22,7 @@ type Message struct {
 var (
 	snsTopicARN         = os.Getenv("SNS_TOPIC_ARN")
 	slackWebhookURL     = os.Getenv("SLACK_WEBHOOK_URL")
-	pagerDutyWebhookURL = os.Getenv("PAGERDUTY_WEBHOOK_URL")
+	pagerDutyRoutingKey = os.Getenv("PAGERDUTY_ROUTING_KEY")
 	responseThreshold   = 10 * time.Second
 	snsClient           *sns.Client
 )
@@ -92,7 +92,7 @@ func sendAlert(message string) error {
 	}
 
 	pagerPayload := map[string]interface{}{
-		"routing_key":  os.Getenv("PAGERDUTY_ROUTING_KEY"),
+		"routing_key":  pagerDutyRoutingKey,
 		"event_action": "trigger",
 		"payload": map[string]interface{}{
 			"summary":   message,
@@ -101,7 +101,8 @@ func sendAlert(message string) error {
 			"timestamp": time.Now().Format(time.RFC3339),
 		},
 	}
-	err = postJSON(pagerDutyWebhookURL, pagerPayload)
+	// Corrected PagerDuty Events API endpoint URL
+	err = postJSON("https://events.pagerduty.com/v2/enqueue", pagerPayload)
 	if err != nil {
 		log.Printf("Failed to send PagerDuty alert: %v", err)
 		return err
@@ -159,10 +160,9 @@ func main() {
 		}
 	}()
 
-	intervalSecondsStr := os.Getenv("PUBLISH_INTERVAL_SECONDS")
 	intervalSeconds := 30
-	if intervalSecondsStr != "" {
-		if val, err := strconv.Atoi(intervalSecondsStr); err == nil {
+	if intervalStr := os.Getenv("PUBLISH_INTERVAL_SECONDS"); intervalStr != "" {
+		if val, err := strconv.Atoi(intervalStr); err == nil {
 			intervalSeconds = val
 		}
 	}
