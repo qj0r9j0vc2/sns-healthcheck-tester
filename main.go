@@ -8,10 +8,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 )
 
@@ -38,8 +42,8 @@ func publishTimestamp(ctx context.Context) error {
 	}
 
 	input := &sns.PublishInput{
-		Message:  awsString(string(payload)),
-		TopicArn: awsString(snsTopicARN),
+		Message:  aws.String(string(payload)),
+		TopicArn: aws.String(snsTopicARN),
 	}
 
 	_, err = snsClient.Publish(ctx, input)
@@ -72,7 +76,7 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		publishedTime.Format(time.RFC3339), receivedTime.Format(time.RFC3339), latency)
 
 	if latency > responseThreshold {
-		err1 := sendAlert("High latency detected: " + latency.String())
+		err1 := sendAlert(fmt.Sprintf("High latency detected: %s", latency))
 		if err1 != nil {
 			log.Printf("Error sending alert: %v", err1)
 		}
@@ -84,28 +88,31 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func sendAlert(message string) error {
-	err := postJSON(slackWebhookURL, map[string]string{
-		"text": message,
-	})
-	if err != nil {
-		log.Printf("Failed to send Slack alert: %v", err)
+	if slackWebhookURL != "" {
+		err := postJSON(slackWebhookURL, map[string]string{
+			"text": message,
+		})
+		if err != nil {
+			log.Printf("Failed to send Slack alert: %v", err)
+		}
 	}
 
-	pagerPayload := map[string]interface{}{
-		"routing_key":  pagerDutyRoutingKey,
-		"event_action": "trigger",
-		"payload": map[string]interface{}{
-			"summary":   message,
-			"source":    "SNS Checker",
-			"severity":  "error",
-			"timestamp": time.Now().Format(time.RFC3339),
-		},
-	}
-	// Corrected PagerDuty Events API endpoint URL
-	err = postJSON("https://events.pagerduty.com/v2/enqueue", pagerPayload)
-	if err != nil {
-		log.Printf("Failed to send PagerDuty alert: %v", err)
-		return err
+	if pagerDutyRoutingKey != "" {
+		pagerPayload := map[string]interface{}{
+			"routing_key":  pagerDutyRoutingKey,
+			"event_action": "trigger",
+			"payload": map[string]interface{}{
+				"summary":   message,
+				"source":    "SNS Checker",
+				"severity":  "error",
+				"timestamp": time.Now().Format(time.RFC3339),
+			},
+		}
+		err := postJSON("https://events.pagerduty.com/v2/enqueue", pagerPayload)
+		if err != nil {
+			log.Printf("Failed to send PagerDuty alert: %v", err)
+			return err
+		}
 	}
 	return nil
 }
@@ -136,30 +143,49 @@ func postJSON(url string, payload interface{}) error {
 	return nil
 }
 
-func awsString(s string) *string {
-	return &s
-}
-
 func main() {
-	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Load AWS Config
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithCredentialsProvider(
+		credentials.NewStaticCredentialsProvider(
+			os.Getenv("AWS_ACCESS_KEY_ID"),
+			os.Getenv("AWS_SECRET_ACCESS_KEY"),
+			"",
+		)))
 	if err != nil {
-		log.Fatalf("unable to load SDK config, %v", err)
+		log.Fatalf("Unable to load AWS SDK config: %v", err)
 	}
+
+	// Initialize SNS Client
 	snsClient = sns.NewFromConfig(cfg)
 
+	// Set up HTTP server
+	server := &http.Server{Addr: ":8080", Handler: http.DefaultServeMux}
 	http.HandleFunc("/callback", callbackHandler)
+
+	// Handle graceful shutdown
 	go func() {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
-		}
-		log.Printf("Starting HTTP server on port %s", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
-			log.Fatalf("failed to start server: %v", err)
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+		<-stop
+		log.Println("Shutting down server...")
+		cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Fatalf("HTTP server Shutdown failed: %v", err)
 		}
 	}()
 
+	// Start HTTP server
+	go func() {
+		log.Println("Starting HTTP server on port 8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
+
+	// Read interval from env
 	intervalSeconds := 30
 	if intervalStr := os.Getenv("PUBLISH_INTERVAL_SECONDS"); intervalStr != "" {
 		if val, err := strconv.Atoi(intervalStr); err == nil {
@@ -169,12 +195,18 @@ func main() {
 	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
 	defer ticker.Stop()
 
+	// Periodically publish timestamps
 	for {
-		err = publishTimestamp(ctx)
-		if err != nil {
-			log.Printf("Error publishing timestamp: %v", err)
-			sendAlert("Error publishing timestamp: " + err.Error())
+		select {
+		case <-ticker.C:
+			err := publishTimestamp(ctx)
+			if err != nil {
+				log.Printf("Error publishing timestamp: %v", err)
+				sendAlert("Error publishing timestamp: " + err.Error())
+			}
+		case <-ctx.Done():
+			log.Println("Stopping timestamp publishing...")
+			return
 		}
-		<-ticker.C
 	}
 }
